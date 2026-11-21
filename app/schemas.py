@@ -102,6 +102,8 @@ class ChannelInfo(BaseModel):
     packets_out: int
     send_errors: int
     ready: bool
+    first_packet_received: bool
+    pending_switches: int
     uptime_seconds: float
     last_packet_age_seconds: float | None
 

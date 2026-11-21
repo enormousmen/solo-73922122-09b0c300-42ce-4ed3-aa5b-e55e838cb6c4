@@ -201,13 +201,14 @@ async def test_switch_moves_traffic(client, sender):
     task_a = asyncio.create_task(spam(ga, pa, b"A"))
     assert (await sink.recv(2.0)).startswith(b"A-")
 
+    # The target channel must be live for the switch to commit.
+    task_b = asyncio.create_task(spam(gb, pb, b"B"))
     r = await _switch(client, sink, gb, pb, from_group=ga, from_port=pa)
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["changed"] is True
     assert (body["from_channel"]["group"], body["from_channel"]["port"]) == (ga, pa)
 
-    task_b = asyncio.create_task(spam(gb, pb, b"B"))
     await sink.drain()  # flush in-flight old-channel datagrams
     msgs = await sink.collect(0.8)
     stop.set()
@@ -221,6 +222,150 @@ async def test_switch_moves_traffic(client, sender):
     assert (ga, pa) not in chans
     assert (gb, pb) in chans
     sink.close()
+
+
+async def test_switch_to_silent_channel_times_out_and_rolls_back(client, relay, sender):
+    """Silent target: 502 after JOIN_TIMEOUT, old subscription untouched."""
+    sink = UdpSink()
+    ga, pa = "239.60.6.1", next_port()
+    gb, pb = "239.60.6.2", next_port()  # nobody ever sends here
+    await client.post(f"{API}/subscriptions", json=sub_body(sink, ga, pa))
+    sender.sendto(b"before", (ga, pa))
+    assert await sink.recv(2.0) == b"before"
+
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    r = await _switch(client, sink, gb, pb, from_group=ga, from_port=pa)
+    elapsed = loop.time() - t0
+    assert r.status_code == 502, r.text
+    assert "no datagram" in r.json()["detail"]
+    # the gateway actually waited for the first datagram, not failed fast
+    assert elapsed >= relay.join_timeout
+
+    # subscription unchanged; the silent channel was cleaned up again
+    subs = (await client.get(f"{API}/subscriptions")).json()["subscriptions"]
+    assert subs == [
+        {"subscriber": sink.endpoint(), "channel": {"group": ga, "port": pa}}
+    ]
+    chans = await _channels(client)
+    assert [(c["group"], c["port"]) for c in chans] == [(ga, pa)]
+    assert chans[0]["pending_switches"] == 0
+
+    # the old channel kept (and keeps) being relayed
+    sender.sendto(b"after", (ga, pa))
+    assert await sink.recv(2.0) == b"after"
+    sink.close()
+
+
+async def test_switch_waits_for_first_packet_then_commits(client, sender):
+    """The switch blocks until the target's first datagram, then commits."""
+    sink = UdpSink()
+    ga, pa = "239.60.6.3", next_port()
+    gb, pb = "239.60.6.4", next_port()
+    await client.post(f"{API}/subscriptions", json=sub_body(sink, ga, pa))
+    sender.sendto(b"a0", (ga, pa))
+    assert await sink.recv(2.0) == b"a0"
+
+    switch_task = asyncio.create_task(_switch(client, sink, gb, pb))
+    await asyncio.sleep(0.3)
+    assert not switch_task.done()  # still waiting for the first datagram
+
+    # the old channel keeps forwarding while the switch is pending
+    sender.sendto(b"a1", (ga, pa))
+    assert await sink.recv(2.0) == b"a1"
+    # the pending switch pins the target channel
+    chans = {c["group"]: c for c in await _channels(client)}
+    assert chans[gb]["pending_switches"] == 1
+    assert chans[gb]["first_packet_received"] is False
+
+    # the first datagram on the target channel lets the switch commit
+    sender.sendto(b"b0", (gb, pb))
+    r = await switch_task
+    assert r.status_code == 200, r.text
+    assert r.json()["changed"] is True
+
+    sender.sendto(b"b1", (gb, pb))
+    assert await sink.recv(2.0) == b"b1"
+    await sink.drain()
+    sender.sendto(b"a2", (ga, pa))
+    assert await sink.recv(0.4) is None  # old channel stopped
+    sink.close()
+
+
+async def test_concurrent_switches_to_same_silent_channel_both_fail(client, sender):
+    """Two subscribers race into the same silent channel: both 502, no leak."""
+    sink1, sink2 = UdpSink(), UdpSink()
+    ga, pa = "239.60.6.5", next_port()
+    gb, pb = "239.60.6.6", next_port()  # silent
+    for s in (sink1, sink2):
+        await client.post(f"{API}/subscriptions", json=sub_body(s, ga, pa))
+
+    r1, r2 = await asyncio.gather(
+        _switch(client, sink1, gb, pb),
+        _switch(client, sink2, gb, pb),
+    )
+    assert r1.status_code == 502, r1.text
+    assert r2.status_code == 502, r2.text
+
+    # both subscribers are still on the old channel; the silent channel
+    # (one shared join) was dropped after both rollbacks
+    chans = await _channels(client)
+    assert [(c["group"], c["port"]) for c in chans] == [(ga, pa)]
+    assert chans[0]["subscriber_count"] == 2
+
+    sender.sendto(b"still-a", (ga, pa))
+    assert await sink1.recv(2.0) == b"still-a"
+    assert await sink2.recv(2.0) == b"still-a"
+    sink1.close()
+    sink2.close()
+
+
+async def test_pending_switch_pins_channel_until_first_packet(client, sender):
+    """The last subscriber may leave while a switch waits on that channel:
+    the pending switch keeps the membership alive and can still commit."""
+    sink1, sink2 = UdpSink(), UdpSink()
+    ga, pa = "239.60.7.1", next_port()
+    gb, pb = "239.60.7.2", next_port()
+    await client.post(f"{API}/subscriptions", json=sub_body(sink1, gb, pb))
+    await client.post(f"{API}/subscriptions", json=sub_body(sink2, ga, pa))
+
+    # sink2 starts switching to the (still silent) channel B
+    switch_task = asyncio.create_task(_switch(client, sink2, gb, pb))
+    await asyncio.sleep(0.3)
+    assert not switch_task.done()
+
+    # sink1 was B's last subscriber; leaving must not drop B yet
+    assert (await _delete(client, sink1)).status_code == 200
+    chans = {c["group"]: c for c in await _channels(client)}
+    assert chans[gb]["subscriber_count"] == 0
+    assert chans[gb]["pending_switches"] == 1
+
+    # the first datagram still commits the pending switch
+    sender.sendto(b"b-first", (gb, pb))
+    r = await switch_task
+    assert r.status_code == 200, r.text
+    sender.sendto(b"b-next", (gb, pb))
+    assert await sink2.recv(2.0) == b"b-next"
+    sink1.close()
+    sink2.close()
+
+
+async def test_switch_wait_cancellation_cleans_up(relay):
+    """A cancelled switch (e.g. client disconnect) releases the pin."""
+    key_a = ("239.60.7.3", next_port())
+    key_b = ("239.60.7.4", next_port())
+    subscriber = ("127.0.0.1", 45678)
+    await relay.subscribe(subscriber, key_a)
+
+    task = asyncio.create_task(relay.switch(subscriber, key_b))
+    await asyncio.sleep(0.3)
+    assert relay._channels[key_b].pending == 1
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert key_b not in relay._channels  # temporary join cleaned up
+    assert relay._sub_index[subscriber] == key_a  # old subscription intact
 
 
 async def test_switch_failure_keeps_old_channel(client, sender):
@@ -263,6 +408,11 @@ async def test_switch_to_existing_channel_shares_membership(client, sender):
     gb, pb = "239.60.3.6", next_port()
     await client.post(f"{API}/subscriptions", json=sub_body(sink1, gb, pb))
     await client.post(f"{API}/subscriptions", json=sub_body(sink2, ga, pa))
+
+    # B is already live: its first datagram arrived, so the switch commits
+    # without waiting for new traffic.
+    sender.sendto(b"b-alive", (gb, pb))
+    assert await sink1.recv(2.0) == b"b-alive"
 
     r = await _switch(client, sink2, gb, pb)
     assert r.status_code == 200
@@ -388,10 +538,26 @@ async def test_concurrent_last_two_switch_away(client, sender):
     for s in (sink1, sink2):
         await client.post(f"{API}/subscriptions", json=sub_body(s, ga, pa))
 
-    r1, r2 = await asyncio.gather(
-        _switch(client, sink1, gb, pb),
-        _switch(client, sink2, gc, pc),
-    )
+    # Both targets must be live for the switches to commit.
+    stop = asyncio.Event()
+
+    async def spam(group: str, port: int) -> None:
+        while not stop.is_set():
+            sender.sendto(b"probe", (group, port))
+            await asyncio.sleep(0.02)
+
+    tasks = [
+        asyncio.create_task(spam(gb, pb)),
+        asyncio.create_task(spam(gc, pc)),
+    ]
+    try:
+        r1, r2 = await asyncio.gather(
+            _switch(client, sink1, gb, pb),
+            _switch(client, sink2, gc, pc),
+        )
+    finally:
+        stop.set()
+        await asyncio.gather(*tasks)
     assert r1.status_code == 200, r1.text
     assert r2.status_code == 200, r2.text
 
@@ -399,6 +565,8 @@ async def test_concurrent_last_two_switch_away(client, sender):
     assert (ga, pa) not in chans  # old channel dropped exactly once
     assert chans == {(gb, pb), (gc, pc)}
 
+    await sink1.drain()
+    await sink2.drain()
     sender.sendto(b"to-b", (gb, pb))
     sender.sendto(b"to-c", (gc, pc))
     assert await sink1.recv(2.0) == b"to-b"
@@ -414,11 +582,27 @@ async def test_concurrent_switch_same_subscriber_from_guard(client, sender):
     gc, pc = "239.60.5.8", next_port()
     await client.post(f"{API}/subscriptions", json=sub_body(sink, ga, pa))
 
-    # Both switches claim the same source channel; exactly one may win.
-    r1, r2 = await asyncio.gather(
-        _switch(client, sink, gb, pb, from_group=ga, from_port=pa),
-        _switch(client, sink, gc, pc, from_group=ga, from_port=pa),
-    )
+    # Both targets are live; both switches claim the same source channel,
+    # so exactly one may win the commit.
+    stop = asyncio.Event()
+
+    async def spam(group: str, port: int) -> None:
+        while not stop.is_set():
+            sender.sendto(b"probe", (group, port))
+            await asyncio.sleep(0.02)
+
+    tasks = [
+        asyncio.create_task(spam(gb, pb)),
+        asyncio.create_task(spam(gc, pc)),
+    ]
+    try:
+        r1, r2 = await asyncio.gather(
+            _switch(client, sink, gb, pb, from_group=ga, from_port=pa),
+            _switch(client, sink, gc, pc, from_group=ga, from_port=pa),
+        )
+    finally:
+        stop.set()
+        await asyncio.gather(*tasks)
     assert sorted(r.status_code for r in (r1, r2)) == [200, 409]
 
     subs = (await client.get(f"{API}/subscriptions")).json()["subscriptions"]
