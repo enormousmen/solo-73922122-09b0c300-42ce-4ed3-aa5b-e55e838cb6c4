@@ -1,0 +1,31 @@
+# IPv4 UDP 组播转播网关。
+#
+# 注意：组播流量无法穿过 Docker 的 NAT/端口映射，因此使用主机网络
+# （network_mode: host，仅 Linux 支持）。此时 ports: 映射不生效，
+# API 直接监听在宿主机的 ${API_PORT:-8000} 上。
+# 若必须跨 overlay/桥接网络传播组播，可改用 macvlan 网络，这里从简。
+
+services:
+  gateway:
+    build: .
+    image: udp-mcast-relay-gateway:latest
+    container_name: udp-mcast-relay-gateway
+    network_mode: host
+    environment:
+      # 组播入组使用的网卡地址；0.0.0.0 表示由内核按默认路由选择。
+      MCAST_INTERFACE: "0.0.0.0"
+      # 新频道入组/就绪的超时时间（秒）。
+      JOIN_TIMEOUT: "5"
+      # API 监听端口（主机网络模式下直接绑定宿主机端口）。
+      API_PORT: "8000"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('API_PORT','8000')+'/healthz',timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
